@@ -53,6 +53,7 @@ fun CustomAlbumDetailScreen(
     album: CustomAlbum,
     allMusicTracks: List<AudioTrack>,
     currentlyPlayingTrackId: Long?,
+    isPlaying: Boolean = false,
     onBackClick: () -> Unit,
     onPlayTrack: (AudioTrack, List<AudioTrack>) -> Unit,
     onShufflePlay: (List<AudioTrack>) -> Unit,
@@ -250,6 +251,7 @@ fun CustomAlbumDetailScreen(
                     AppleTrackItem(
                         track = track,
                         isCurrentlyPlaying = track.id == currentlyPlayingTrackId,
+                        isPlaying = isPlaying,
                         isSelected = false,
                         isSelectionMode = false,
                         onClick = { onPlayTrack(track, albumTracks) },

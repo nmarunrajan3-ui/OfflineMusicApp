@@ -1,18 +1,18 @@
 package com.auramusic.offline.service
 
 import android.app.Service
-import android.content.Context
 import android.content.Intent
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
-import android.media.AudioManager
-import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Binder
-import android.os.Build
 import android.os.IBinder
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
 import com.auramusic.offline.data.RecentlyPlayedRepository
 import com.auramusic.offline.model.AudioTrack
 import com.auramusic.offline.model.PlaybackState
@@ -30,20 +30,17 @@ import kotlinx.coroutines.launch
 import java.io.File
 import kotlin.random.Random
 
-class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPlayer.OnCompletionListener, MediaPlayer.OnErrorListener {
+class MusicPlaybackService : Service() {
 
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
 
-    private var mediaPlayer: MediaPlayer? = null
+    private var exoPlayer: ExoPlayer? = null
     private var mediaSession: MediaSessionCompat? = null
-    private lateinit var audioManager: AudioManager
-    private var audioFocusRequest: AudioFocusRequest? = null
 
     private var currentPlaylist: List<AudioTrack> = emptyList()
     private var currentTrackIndex: Int = -1
     private var shuffleIndices: List<Int> = emptyList()
-    private var isPrepared = false
 
     private var progressTrackingJob: Job? = null
     private var sleepTimerJob: Job? = null
@@ -69,7 +66,6 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
     override fun onCreate() {
         super.onCreate()
         recentRepo = RecentlyPlayedRepository(this)
-        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         MediaNotificationHelper.createNotificationChannel(this)
 
@@ -85,26 +81,71 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
             isActive = true
         }
 
-        initMediaPlayer()
+        initExoPlayer()
     }
 
-    private fun initMediaPlayer() {
+    private fun initExoPlayer() {
         try {
-            mediaPlayer?.release()
+            exoPlayer?.release()
         } catch (_: Exception) {}
 
-        isPrepared = false
-        mediaPlayer = MediaPlayer().apply {
-            setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .build()
-            )
-            setOnPreparedListener(this@MusicPlaybackService)
-            setOnCompletionListener(this@MusicPlaybackService)
-            setOnErrorListener(this@MusicPlaybackService)
-        }
+        val audioAttributes = AudioAttributes.Builder()
+            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+            .setUsage(C.USAGE_MEDIA)
+            .build()
+
+        exoPlayer = ExoPlayer.Builder(this)
+            .setAudioAttributes(audioAttributes, /* handleAudioFocus = */ true)
+            .setHandleAudioBecomingNoisy(true)
+            .build().apply {
+                addListener(object : Player.Listener {
+                    override fun onPlaybackStateChanged(playbackState: Int) {
+                        when (playbackState) {
+                            Player.STATE_READY -> {
+                                val dur = duration.coerceAtLeast(0L)
+                                _playbackState.value = _playbackState.value.copy(
+                                    durationMs = dur,
+                                    queue = currentPlaylist,
+                                    currentQueueIndex = currentTrackIndex
+                                )
+                                updateMediaSessionState(
+                                    if (isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED,
+                                    currentPosition
+                                )
+                            }
+                            Player.STATE_ENDED -> {
+                                if (_playbackState.value.repeatMode == RepeatMode.ONE) {
+                                    this@MusicPlaybackService.seekTo(0L)
+                                    this@MusicPlaybackService.play()
+                                } else {
+                                    this@MusicPlaybackService.next()
+                                }
+                            }
+                            Player.STATE_BUFFERING -> {
+                                updateMediaSessionState(PlaybackStateCompat.STATE_BUFFERING, currentPosition)
+                            }
+                            Player.STATE_IDLE -> {}
+                        }
+                    }
+
+                    override fun onIsPlayingChanged(isPlaying: Boolean) {
+                        _playbackState.value = _playbackState.value.copy(isPlaying = isPlaying)
+                        if (isPlaying) {
+                            startProgressTracking()
+                            updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING, currentPosition)
+                        } else {
+                            stopProgressTracking()
+                            updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED, currentPosition)
+                            recentRepo.saveLastPosition(currentPosition)
+                        }
+                        updateNotification()
+                    }
+
+                    override fun onPlayerError(error: PlaybackException) {
+                        error.printStackTrace()
+                    }
+                })
+            }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -185,17 +226,52 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         }
     }
 
+    private fun resolveTrackUri(track: AudioTrack): Uri {
+        val file = File(track.dataPath)
+        return if (file.exists() && file.length() > 0) {
+            Uri.fromFile(file)
+        } else if (track.contentUriString.isNotBlank()) {
+            try {
+                val parsed = Uri.parse(track.contentUriString)
+                contentResolver.openInputStream(parsed)?.close()
+                parsed
+            } catch (_: Exception) {
+                Uri.fromFile(AudioSynthFallback.getOrCreateDemoAudioFile(this))
+            }
+        } else {
+            Uri.fromFile(AudioSynthFallback.getOrCreateDemoAudioFile(this))
+        }
+    }
+
     fun restoreTrackWithoutPlaying(track: AudioTrack, playlist: List<AudioTrack>) {
         currentPlaylist = playlist
         currentTrackIndex = playlist.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
         generateShuffleList()
+
+        if (exoPlayer == null) {
+            initExoPlayer()
+        }
+
+        val lastPos = recentRepo.getLastPosition().coerceAtLeast(0L)
+        try {
+            val uri = resolveTrackUri(track)
+            val mediaItem = MediaItem.fromUri(uri)
+            exoPlayer?.apply {
+                setMediaItem(mediaItem)
+                prepare()
+                pause()
+                if (lastPos > 0) {
+                    seekTo(lastPos)
+                }
+            }
+        } catch (_: Exception) {}
 
         serviceScope.launch {
             val (primary, secondary) = ColorExtractor.extractColorsFromUri(this@MusicPlaybackService, track.albumArtUri)
             _playbackState.value = _playbackState.value.copy(
                 currentTrack = track,
                 isPlaying = false,
-                currentPositionMs = recentRepo.getLastPosition(),
+                currentPositionMs = lastPos,
                 durationMs = track.durationMs,
                 dominantColor = primary,
                 secondaryColor = secondary,
@@ -207,30 +283,22 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
 
     private fun loadAndPlay(track: AudioTrack) {
         try {
-            requestAudioFocus()
-            initMediaPlayer()
-
-            val file = File(track.dataPath)
-            val uri: Uri = if (file.exists() && file.length() > 0) {
-                Uri.fromFile(file)
-            } else if (track.contentUriString.isNotBlank()) {
-                try {
-                    val parsed = Uri.parse(track.contentUriString)
-                    contentResolver.openInputStream(parsed)?.close()
-                    parsed
-                } catch (e: Exception) {
-                    Uri.fromFile(AudioSynthFallback.getOrCreateDemoAudioFile(this))
-                }
-            } else {
-                Uri.fromFile(AudioSynthFallback.getOrCreateDemoAudioFile(this))
+            if (exoPlayer == null) {
+                initExoPlayer()
             }
 
-            mediaPlayer?.setDataSource(this, uri)
-            mediaPlayer?.prepareAsync()
+            val uri: Uri = resolveTrackUri(track)
+            val mediaItem = MediaItem.fromUri(uri)
+
+            exoPlayer?.apply {
+                setMediaItem(mediaItem)
+                prepare()
+                play()
+            }
 
             recentRepo.recordTrackPlayed(track.id)
 
-            // Extract dynamic Apple Music palette
+            // Dynamic Apple Music gradient palette extraction
             serviceScope.launch {
                 val (primary, secondary) = ColorExtractor.extractColorsFromUri(this@MusicPlaybackService, track.albumArtUri)
                 _playbackState.value = _playbackState.value.copy(
@@ -249,44 +317,30 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
             updateNotification()
         } catch (e: Exception) {
             e.printStackTrace()
-            isPrepared = false
         }
-    }
-
-    override fun onPrepared(mp: MediaPlayer?) {
-        isPrepared = true
-        mp?.start()
-        _playbackState.value = _playbackState.value.copy(
-            isPlaying = true,
-            durationMs = mp?.duration?.toLong() ?: 0L,
-            queue = currentPlaylist,
-            currentQueueIndex = currentTrackIndex
-        )
-        startProgressTracking()
-        updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING, mp?.currentPosition?.toLong() ?: 0L)
-        updateNotification()
     }
 
     fun play() {
-        val current = _playbackState.value.currentTrack
-        if (mediaPlayer == null) {
-            initMediaPlayer()
+        if (exoPlayer == null) {
+            initExoPlayer()
         }
 
-        if (current != null) {
-            if (isPrepared && mediaPlayer != null) {
-                try {
-                    requestAudioFocus()
-                    mediaPlayer?.start()
-                    _playbackState.value = _playbackState.value.copy(isPlaying = true)
-                    startProgressTracking()
-                    updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING, mediaPlayer?.currentPosition?.toLong() ?: 0L)
-                    updateNotification()
-                    return
-                } catch (_: Exception) {
-                    // Fall back to clean reload
-                }
-            }
+        val p = exoPlayer ?: return
+        val current = _playbackState.value.currentTrack
+
+        if (p.playbackState == Player.STATE_ENDED) {
+            p.seekTo(0L)
+            p.play()
+            return
+        }
+
+        if (p.mediaItemCount > 0) {
+            p.play()
+            _playbackState.value = _playbackState.value.copy(isPlaying = true)
+            startProgressTracking()
+            updateMediaSessionState(PlaybackStateCompat.STATE_PLAYING, p.currentPosition)
+            updateNotification()
+        } else if (current != null) {
             loadAndPlay(current)
         } else if (currentPlaylist.isNotEmpty()) {
             playTrackList(currentPlaylist, 0)
@@ -294,21 +348,19 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
     }
 
     fun pause() {
-        try {
-            if (mediaPlayer?.isPlaying == true) {
-                mediaPlayer?.pause()
-            }
-        } catch (_: Exception) {}
-
+        val p = exoPlayer
+        p?.pause()
         _playbackState.value = _playbackState.value.copy(isPlaying = false)
         stopProgressTracking()
-        updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED, mediaPlayer?.currentPosition?.toLong() ?: 0L)
+        val pos = p?.currentPosition ?: 0L
+        updateMediaSessionState(PlaybackStateCompat.STATE_PAUSED, pos)
         updateNotification()
-        recentRepo.saveLastPosition(mediaPlayer?.currentPosition?.toLong() ?: 0L)
+        recentRepo.saveLastPosition(pos)
     }
 
     fun togglePlayPause() {
-        if (_playbackState.value.isPlaying) {
+        val p = exoPlayer
+        if (p != null && p.isPlaying) {
             pause()
         } else {
             play()
@@ -318,8 +370,10 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
     fun next() {
         if (currentPlaylist.isEmpty()) return
         val repeat = _playbackState.value.repeatMode
+
         if (repeat == RepeatMode.ONE) {
-            loadAndPlay(currentPlaylist[currentTrackIndex])
+            exoPlayer?.seekTo(0L)
+            exoPlayer?.play()
             return
         }
 
@@ -333,7 +387,7 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
                 currentTrackIndex = 0
             } else {
                 pause()
-                seekTo(0)
+                seekTo(0L)
                 return
             }
         }
@@ -342,10 +396,9 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
 
     fun previous() {
         if (currentPlaylist.isEmpty()) return
-        // If current position is > 3 seconds, rewind to start like Apple Music
-        val currentPos = mediaPlayer?.currentPosition ?: 0
-        if (currentPos > 3000) {
-            seekTo(0)
+        val currentPos = exoPlayer?.currentPosition ?: 0L
+        if (currentPos > 3000L) {
+            seekTo(0L)
             return
         }
 
@@ -363,9 +416,7 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
     }
 
     fun seekTo(positionMs: Long) {
-        try {
-            mediaPlayer?.seekTo(positionMs.toInt())
-        } catch (_: Exception) {}
+        exoPlayer?.seekTo(positionMs)
         _playbackState.value = _playbackState.value.copy(currentPositionMs = positionMs)
         updateMediaSessionState(
             if (_playbackState.value.isPlaying) PlaybackStateCompat.STATE_PLAYING else PlaybackStateCompat.STATE_PAUSED,
@@ -406,7 +457,7 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
                 _playbackState.value = _playbackState.value.copy(sleepTimerSecondsRemaining = remaining)
             }
 
-            // Smooth fade out over 3 seconds before pausing
+            // Smooth fade out over 2.5 seconds before pausing
             if (remaining <= 0) {
                 fadeOutAndPause()
                 _playbackState.value = _playbackState.value.copy(sleepTimerSecondsRemaining = null)
@@ -417,31 +468,17 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
     private suspend fun fadeOutAndPause() {
         try {
             val steps = 10
+            val p = exoPlayer
             for (i in steps downTo 0) {
                 val volume = i.toFloat() / steps.toFloat()
-                mediaPlayer?.setVolume(volume, volume)
+                p?.volume = volume
                 delay(250L)
             }
             pause()
-            mediaPlayer?.setVolume(1.0f, 1.0f) // reset volume for next play
-        } catch (e: Exception) {
+            p?.volume = 1.0f // reset volume for next play
+        } catch (_: Exception) {
             pause()
         }
-    }
-
-    override fun onCompletion(mp: MediaPlayer?) {
-        if (_playbackState.value.repeatMode == RepeatMode.ONE) {
-            seekTo(0)
-            play()
-        } else {
-            next()
-        }
-    }
-
-    override fun onError(mp: MediaPlayer?, what: Int, extra: Int): Boolean {
-        isPrepared = false
-        initMediaPlayer()
-        return true
     }
 
     private fun startProgressTracking() {
@@ -449,8 +486,11 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         progressTrackingJob = serviceScope.launch {
             while (isActive) {
                 try {
-                    val current = mediaPlayer?.currentPosition?.toLong() ?: 0L
-                    _playbackState.value = _playbackState.value.copy(currentPositionMs = current)
+                    val p = exoPlayer
+                    if (p != null) {
+                        val current = p.currentPosition
+                        _playbackState.value = _playbackState.value.copy(currentPositionMs = current)
+                    }
                 } catch (_: Exception) {}
                 delay(400L)
             }
@@ -496,44 +536,14 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         )
     }
 
-    private fun requestAudioFocus() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val playbackAttributes = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                .build()
-
-            audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                .setAudioAttributes(playbackAttributes)
-                .setAcceptsDelayedFocusGain(true)
-                .setOnAudioFocusChangeListener { focusChange ->
-                    when (focusChange) {
-                        AudioManager.AUDIOFOCUS_LOSS -> pause()
-                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> pause()
-                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                            try { mediaPlayer?.setVolume(0.2f, 0.2f) } catch (_: Exception) {}
-                        }
-                        AudioManager.AUDIOFOCUS_GAIN -> {
-                            try { mediaPlayer?.setVolume(1.0f, 1.0f) } catch (_: Exception) {}
-                            play()
-                        }
-                    }
-                }
-                .build()
-
-            audioManager.requestAudioFocus(audioFocusRequest!!)
-        }
-    }
-
     fun stopService() {
         stopProgressTracking()
         sleepTimerJob?.cancel()
         try {
-            mediaPlayer?.stop()
-            mediaPlayer?.release()
+            exoPlayer?.stop()
+            exoPlayer?.release()
         } catch (_: Exception) {}
-        mediaPlayer = null
-        isPrepared = false
+        exoPlayer = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -543,10 +553,9 @@ class MusicPlaybackService : Service(), MediaPlayer.OnPreparedListener, MediaPla
         sleepTimerJob?.cancel()
         mediaSession?.release()
         try {
-            mediaPlayer?.release()
+            exoPlayer?.release()
         } catch (_: Exception) {}
-        mediaPlayer = null
-        isPrepared = false
+        exoPlayer = null
         super.onDestroy()
     }
 }

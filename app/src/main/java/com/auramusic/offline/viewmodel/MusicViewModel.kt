@@ -210,10 +210,27 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val intent = Intent(getApplication(), MusicPlaybackService::class.java)
         getApplication<Application>().startService(intent)
 
+        if (track.id == playbackState.value.currentTrack?.id) {
+            if (!playbackState.value.isPlaying) {
+                playbackService?.play()
+            }
+            return
+        }
+
         val index = playlist.indexOfFirst { it.id == track.id }
         playbackService?.playTrackList(playlist, if (index != -1) index else 0)
         recentlyPlayedRepo.recordTrackPlayed(track.id)
         _recentIds.value = recentlyPlayedRepo.getRecentTrackIds()
+    }
+
+    fun play() {
+        val intent = Intent(getApplication(), MusicPlaybackService::class.java)
+        getApplication<Application>().startService(intent)
+        playbackService?.play()
+    }
+
+    fun pause() {
+        playbackService?.pause()
     }
 
     fun playNext(track: AudioTrack) {

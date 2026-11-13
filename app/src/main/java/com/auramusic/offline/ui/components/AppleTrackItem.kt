@@ -66,6 +66,7 @@ fun AppleTrackItem(
     onToggleFavorite: () -> Unit,
     onAddToAlbumClick: () -> Unit,
     onMoveToTrashClick: () -> Unit,
+    isPlaying: Boolean = false,
     onPlayNextClick: () -> Unit = {},
     onAddToQueueClick: () -> Unit = {},
     onLongClick: () -> Unit = {},
@@ -147,7 +148,7 @@ fun AppleTrackItem(
                         contentAlignment = Alignment.Center
                     ) {
                         EqualizerBars(
-                            isPlaying = true,
+                            isPlaying = isPlaying,
                             barColor = AppleCrimson,
                             maxHeight = 18.dp
                         )

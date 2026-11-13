@@ -11,6 +11,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -532,14 +533,16 @@ fun NowPlayingFullScreen(
                     }
 
                     // Authentic Apple Music Play / Pause Borderless White Glyph
+                    val playPauseSource = remember { MutableInteractionSource() }
                     IconButton(
                         onClick = {
                             HapticHelper.mediumClick(context)
                             onPlayPauseClick()
                         },
+                        interactionSource = playPauseSource,
                         modifier = Modifier
-                            .size(62.dp)
-                            .bounceScale(0.86f)
+                            .size(64.dp)
+                            .bounceScale(playPauseSource, 0.86f)
                     ) {
                         Icon(
                             imageVector = if (playbackState.isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,

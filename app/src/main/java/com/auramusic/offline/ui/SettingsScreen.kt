@@ -146,8 +146,8 @@ fun SettingsScreen(
 
                 SettingsInfoRow(
                     icon = Icons.Rounded.GraphicEq,
-                    title = "Studio Sound Engine",
-                    subtitle = "High-fidelity 44.1kHz 16-bit stereo acoustic fallback"
+                    title = "AndroidX Media3 (ExoPlayer)",
+                    subtitle = "Pro low-latency 44.1kHz 16-bit audio engine • Gapless playback & auto audio focus"
                 )
             }
 

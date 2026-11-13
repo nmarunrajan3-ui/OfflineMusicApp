@@ -80,4 +80,8 @@ dependencies {
 
     // AndroidX Media for background playback notification & lock screen
     implementation("androidx.media:media:1.7.0")
+
+    // Industry-standard Google AndroidX Media3 ExoPlayer Engine
+    implementation("androidx.media3:media3-exoplayer:1.2.1")
+    implementation("androidx.media3:media3-session:1.2.1")
 }

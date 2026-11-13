@@ -232,6 +232,7 @@ fun HomeScreen(
                             album = selectedAlbumForDetail!!,
                             allMusicTracks = musicTracks,
                             currentlyPlayingTrackId = playbackState.currentTrack?.id,
+                            isPlaying = playbackState.isPlaying,
                             onBackClick = { selectedAlbumForDetail = null },
                             onPlayTrack = { track, list -> viewModel.playTrack(track, list) },
                             onShufflePlay = { list ->
@@ -563,6 +564,7 @@ fun HomeScreen(
                                                     AppleTrackItem(
                                                         track = track,
                                                         isCurrentlyPlaying = track.id == playbackState.currentTrack?.id,
+                                                        isPlaying = playbackState.isPlaying,
                                                         isSelected = selectedTrackIds.contains(track.id),
                                                         isSelectionMode = isSelectionMode,
                                                         onClick = { viewModel.playTrack(track, musicTracks) },
@@ -617,6 +619,7 @@ fun HomeScreen(
                                                 AppleTrackItem(
                                                     track = track,
                                                     isCurrentlyPlaying = track.id == playbackState.currentTrack?.id,
+                                                    isPlaying = playbackState.isPlaying,
                                                     isSelected = selectedTrackIds.contains(track.id),
                                                     isSelectionMode = isSelectionMode,
                                                     onClick = { viewModel.playTrack(track, favoriteTracks) },
